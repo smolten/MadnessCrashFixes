@@ -40,7 +40,7 @@ Run `launch-alice-cheatengine.ps1` from this directory. It will:
 
 - [Cheat Engine](https://www.cheatengine.org/) (32-bit, `cheatengine-i386.exe`)
 - Alice: Madness Returns (Steam build)
-- Compatible with [MadnessPatch](https://github.com/nipkownern/MadnessPatch)
+- Compatible with [MadnessPatch](https://github.com/Wemino/MadnessPatch)
 
 ## How it works
 
