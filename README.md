@@ -66,3 +66,4 @@ Run `launch-alice-cheatengine.ps1` from this directory. It will:
 All patches include diagnostic logging to a ring buffer for post-mortem analysis.
 
 See the images in `img/` for example crash logs.
+<img width="1300" height="600" alt="Hair Physics explained" src="https://github.com/user-attachments/assets/c3288f5c-788c-4fd5-a408-41a7129b30e5" /><img width="1920" height="1080" alt="Zombie Object" src="https://github.com/user-attachments/assets/ad91186e-bed9-48ef-9cf1-08d25826b161" />
