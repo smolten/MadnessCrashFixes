@@ -15,7 +15,7 @@ All patches include diagnostic logging to a ring buffer for post-mortem analysis
 
 ## Files
 
-- **`AliceMadnessReturns.CT`** -- Cheat Engine table with all crash fixes (ID 0) and diagnostic logging
+- **`AliceMadnessReturns.CT`** -- Cheat Engine table with crash fixes and diagnostic logging
 - **`launch-alice-cheatengine.ps1`** -- PowerShell launcher: starts game via Steam, waits for process, installs autoattach, launches CE
 - **`alice-autoattach.lua`** -- CE autorun script template; stamps in the CT path at launch time, self-deletes after running
 - **`img/`** -- Reference screenshots of crash sites
@@ -34,7 +34,7 @@ Run `launch-alice-cheatengine.ps1` from this directory. It will:
 ### Manual
 
 1. Open Cheat Engine and attach to `AliceMadnessReturns.exe`
-2. Load `AliceMadnessReturns.CT`
+2. Load `AliceMadnessReturns.CT`, or place it in user's "Documents/My Cheat Tables" for Cheat Engine to find on attach to `AliceMadnessReturns.exe`
 3. Tick "Fix Crashes" and "Kill Zombie BreakableObject"
 
 ## Requirements
