@@ -8,12 +8,17 @@
       <AssemblerScript>{ Alice: Madness Returns — stock-bug patches with diagnostic logging
   Targets vanilla AliceMadnessReturns.exe (Steam build), tested extensively with MadnessPatch installed.
 
-  Crash 1: curve evaluator over-reads knot array by 0xB0 bytes
-           (single-byte fix at +0x79593C).
-  Crash 2/3 family: linked-list iterator advance derefs sentinel `1`
-           as a node pointer. Patched at the source (operator++ and
-           operator+=) so any caller is automatically protected.
-           Defense-in-depth call-site guard at +0xBE0F63.
+  README # → CT crash / site_id mapping:
+    README  1 (Hair curve over-read)        → Crash 1,  site_id 4+5, patches +79593C +7957AA +795922
+    README  2 (Linked-list iter op++/op+=)  → Crash 2/3, site_id 1+2+3, patches +BDA65F +BDA69F +BE0F63
+    README  3 (Linked-list walk sentinel)   → Crash 8,  site_id 9,   patch +E36F7
+    README  4 (MMX over-read)               → Crash 5,  site_id 6,   patch +43D2FD
+    README  5 (Vtable corrupt object)       → Crash 6,  site_id 7,   patch +FDAA8
+    README  6 (Header-prefix deref)         → Crash 7,  site_id 8,   patch +819F3A
+    README  7 (Corrupted-object low-addr)   → Crash 9,  site_id 0xA, patch +75183A
+    README  8 (Vtable slot garbage)         → Crash 10, site_id 0xB, patch +1316A6
+    README  9 (Null-this during teardown)   → Crash 11, (no site_id), patch +BDF916
+    README 10 (Zombie BreakableObject)      → Entry ID 7 (separate CE entry)
 
   Each sentinel detection logs to a ring buffer. Read it from CE Lua:
      getAddress("amr_log_buf")  -- buffer base
