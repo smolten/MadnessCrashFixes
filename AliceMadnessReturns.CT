@@ -1,0 +1,1677 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="46">
+  <CheatEntries>
+    <CheatEntry>
+      <ID>0</ID>
+      <Description>""Fix Crashes: Hair Curve (2) + Linked-List (4) + Worker (6)""</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>{ Alice: Madness Returns — stock-bug patches with diagnostic logging
+  Targets vanilla AliceMadnessReturns.exe (Steam build), tested extensively with MadnessPatch installed.
+
+  Crash 1: curve evaluator over-reads knot array by 0xB0 bytes
+           (single-byte fix at +0x79593C).
+  Crash 2/3 family: linked-list iterator advance derefs sentinel `1`
+           as a node pointer. Patched at the source (operator++ and
+           operator+=) so any caller is automatically protected.
+           Defense-in-depth call-site guard at +0xBE0F63.
+
+  Each sentinel detection logs to a ring buffer. Read it from CE Lua:
+     getAddress("amr_log_buf")  -- buffer base
+     dumpAmrLog()               -- defined below in [ENABLE]
+}
+
+[ENABLE]
+
+// === State check + auto-heal ===
+// Every patch site is one of:
+//   Vanilla         -- expected bytes present, proceed normally
+//   Stale-patched   -- our previous patch is still present (e.g. user reloaded
+//                      the table without untick-then-tick). Restore vanilla
+//                      bytes in process memory so the AA writes below succeed.
+//   Unexpected      -- bytes don't match either form. Abort loudly so we don't
+//                      stomp on whatever else is going on.
+{$lua}
+-- Global helper: returns true only if the game process is actually alive.
+-- getAddress() returns cached values even after process death, so we verify
+-- by reading a byte from the module base.
+function amrProcessAlive()
+  local b = getAddress("AliceMadnessReturns.exe")
+  if not b or b == 0 then return false end
+  return readByte(b) ~= nil
+end
+
+do
+  if not amrProcessAlive() then
+    error("[amr] Not attached to AliceMadnessReturns.exe -- attach CE first.")
+  end
+  local base = getAddress("AliceMadnessReturns.exe")
+  -- {rva, vanilla bytes (hex), expected first byte of our patched form}
+  local sites = {
+    {0x79593C, "60",                                                       0xB0},
+    {0x7957AA, "55 8B EC 83 EC 48",                                        0xE9},
+    {0x795922, "3B CE 74 0E 83 C1 50 3B CE 8B 4D E0 74 04 0F 28 61 60",    0xE9},
+    {0xBDA65F, "8B 41 04 89 02",                                           0xE9},
+    {0xBDA69F, "8B 50 04 89 11",                                           0xE9},
+    {0xBE0F63, "8B 08 E8 A6 E9 FF FF",                                     0xE9},
+    {0x43D2FD, "0F 6F 09 0F 7F C2",                                        0xE9},
+    {0xFDAA8,  "8B 11 8B 82 08 01 00 00",                                  0xE9},
+    {0x819F3A, "8B 48 FC 8B 51 08 83 C0 FC 50 FF D2",                      0xE9},
+    {0xE36F7,  "8B 41 28 3B C3",                                           0xE9},
+    {0x75183A, "0F B7 14 5A 0F AF 56 0C",                                  0xE9},
+    {0x1316A6, "8B 82 78 02 00 00 FF D0",                                  0xE9},
+    {0xBDF916, "89 4D BC C6 45 FF 00",                                     0xE9},
+  }
+  local function hex2bytes(s)
+    local t = {}
+    for b in s:gmatch("%x%x") do t[#t+1] = tonumber(b, 16) end
+    return t
+  end
+  local function bytesMatch(addr, bytes)
+    for i = 1, #bytes do
+      if readByte(addr + i - 1) ~= bytes[i] then return false end
+    end
+    return true
+  end
+  local healed, errors = {}, {}
+  for _, s in ipairs(sites) do
+    local rva, vhex, patched_first = s[1], s[2], s[3]
+    local addr = base + rva
+    local vanilla = hex2bytes(vhex)
+    if bytesMatch(addr, vanilla) then
+      -- vanilla, ok
+    elseif readByte(addr) == patched_first then
+      for i = 1, #vanilla do writeByte(addr + i - 1, vanilla[i]) end
+      healed[#healed+1] = string.format("+0x%X", rva)
+    else
+      local got = ""
+      for i = 0, math.min(#vanilla - 1, 7) do
+        got = got .. string.format("%02X ", readByte(addr + i))
+      end
+      errors[#errors+1] = string.format("  +0x%X: got [%s], expected vanilla [%s] or patched (first 0x%02X)",
+        rva, got, vhex, patched_first)
+    end
+  end
+  if #errors > 0 then
+    print("[amr] UNEXPECTED bytes -- not vanilla, not our patch:")
+    for _, e in ipairs(errors) do print(e) end
+    error("[amr] Aborting. Relaunch the game and re-attach CE, then try again.")
+  end
+  if #healed > 0 then
+    print(string.format("[amr] State: %d stale patch site(s) detected and healed (%s). Re-applying.",
+      #healed, table.concat(healed, ", ")))
+  else
+    print("[amr] State: vanilla. Applying patches.")
+  end
+end
+{$asm}
+
+// === Crash 1 (single-byte fix): prevent knot-array over-read ===
+// Changes comparison bound at +0x79593C from 0x60 to 0xB0.
+// Redundant when the +0x795922 code cave is active, but applied as
+// belt-and-suspenders defense.
+AliceMadnessReturns.exe+79593C:
+  db B0
+
+// IMPORTANT: ordering rule for this script
+//   alloc()'d symbols must appear BEFORE any code that references them.
+//   CE's auto-assembler does not resolve forward references to allocs.
+//   So: ring buffer + logger first, then anything that calls amr_log_fn.
+
+// === Diagnostic ring buffer + logger ===
+// Buffer layout:
+//   +0x00  total_hits (counter, monotonically increasing)
+//   +0x04..0x0F  reserved
+//   +0x10..     ring of 256 entries x 0x40 bytes each
+// Entry layout (0x40 bytes):
+//   +0x00  hit#
+//   +0x04  site_id  (1=op++, 2=op+=, 3=callsite, 4=curve over-read, 5=curve eval entry)
+//   +0x08  bad_value (the sentinel observed; 0 for fn-entry log)
+//   +0x0C  caller_eip  (return address of `call amr_log_fn`)
+//   +0x10..0x3F  12 dwords of caller's stack above the pushed args
+alloc(amr_log_buf, 0x5000)
+registersymbol(amr_log_buf)
+amr_log_buf:
+  dd 0
+
+// Eviction-detect flag: set when an AV-prone entry (site=4) is about to
+// be overwritten before Lua has pulled it. Lua's timer reads this and
+// can react (auto-dump, warn).
+alloc(amr_pending_pull, 4)
+registersymbol(amr_pending_pull)
+amr_pending_pull:
+  dd 0
+
+// Logger: stdcall convention.
+// Args on stack (from caller's `push bad; push site; call amr_log_fn`):
+//   [esp+4] = site_id
+//   [esp+8] = bad_value
+// Returns with `ret 8`. Preserves all regs and flags.
+alloc(amr_log_fn, 0x200)
+registersymbol(amr_log_fn)
+amr_log_fn:
+  pushfd
+  pushad
+  // ebx = old counter; increment global
+  mov eax, [amr_log_buf]
+  mov ebx, eax
+  inc ebx
+  mov [amr_log_buf], ebx
+  // edi = entry ptr = amr_log_buf + 0x10 + (eax mod 256) * 0x40
+  and eax, 000000FF
+  shl eax, 6
+  mov edi, amr_log_buf
+  add edi, 10
+  add edi, eax
+  // Check if the slot we're about to overwrite holds an AV-prone entry
+  // (site_id field at +4 == 4). If so, raise the pending-pull flag so Lua
+  // knows we just lost diagnostic data.
+  cmp dword ptr [edi+4], 4
+  jne amr_log_no_evict
+  mov dword ptr [amr_pending_pull], 1
+amr_log_no_evict:
+  // write header
+  mov eax, [amr_log_buf]
+  dec eax                       // hit# = pre-increment counter value
+  stosd
+  mov eax, [esp+28]             // site_id (pushfd=4 + pushad=20 + ret=4 = 28)
+  stosd
+  mov eax, [esp+2C]             // bad_value
+  stosd
+  mov eax, [esp+24]             // caller_eip = ret_addr from call amr_log_fn
+  stosd
+  // copy 12 dwords of caller's stack starting just above the pushed args
+  lea esi, [esp+30]
+  mov ecx, 0C
+  rep movsd
+  popad
+  popfd
+  ret 8
+
+
+// === Diagnostic: log curve evaluator invocations (site_id=5, "upper level") ===
+// Hook the function prologue at +0x7957AA. Each call:
+//   - bumps amr_curve_count
+//   - emits a log ring entry tagged site_id=5 capturing the caller's stack
+// One call here ~= one character animation tick (~312 inner SIMD loops),
+// so this is much coarser than the over-read save log (site_id=4) and
+// gives a usable per-frame view.
+alloc(amr_curve_count, 4)
+registersymbol(amr_curve_count)
+amr_curve_count:
+  dd 0
+
+// Per-batch VirtualQuery state.
+//   amr_av_call_seen     = per-outer-call flag (0 at upper hook, 1 on first AV)
+//   amr_curve_av_calls   = outer calls where AT LEAST ONE batch was on an
+//                          uncommitted page (would have AV'd in vanilla)
+//   amr_curve_av_batches = total batches with uncommitted over-read address
+//   amr_vq_buf           = 28-byte MEMORY_BASIC_INFORMATION buffer
+alloc(amr_av_call_seen, 4)
+registersymbol(amr_av_call_seen)
+amr_av_call_seen:
+  dd 0
+
+alloc(amr_curve_av_calls, 4)
+registersymbol(amr_curve_av_calls)
+amr_curve_av_calls:
+  dd 0
+
+alloc(amr_curve_av_batches, 4)
+registersymbol(amr_curve_av_batches)
+amr_curve_av_batches:
+  dd 0
+
+alloc(amr_vq_buf, 0x20)
+amr_vq_buf:
+  dd 0,0,0,0,0,0,0,0
+
+// VQ region cache (single-entry). Set after a real VQ; invalidated at
+// the start of each outer call so stale page-state can't survive into
+// a new tick. Counters expose how effective the cache is.
+alloc(amr_vq_last_base,    4)
+alloc(amr_vq_last_size,    4)
+alloc(amr_vq_last_state,   4)
+alloc(amr_vq_cache_hits,   4)
+alloc(amr_vq_cache_misses, 4)
+registersymbol(amr_vq_cache_hits)
+registersymbol(amr_vq_cache_misses)
+amr_vq_last_base:
+  dd 0
+amr_vq_last_size:
+  dd 0
+amr_vq_last_state:
+  dd 0
+amr_vq_cache_hits:
+  dd 0
+amr_vq_cache_misses:
+  dd 0
+
+alloc(amr_curve_hook, 0x80, AliceMadnessReturns.exe+7957AA)
+amr_curve_hook:
+  inc dword ptr [amr_curve_count]
+  mov dword ptr [amr_av_call_seen], 0   // reset per-call AV-seen flag
+  mov dword ptr [amr_vq_last_size], 0   // invalidate VQ region cache
+  push 0                       // bad_value (n/a for fn-entry log)
+  push 5                       // site_id = 5 (curve eval call)
+  call amr_log_fn              // preserves all regs+flags via pushad/pushfd
+  // Original prologue replicated below so we can jmp past the patched bytes.
+  push ebp
+  mov ebp, esp
+  sub esp, 48
+  jmp AliceMadnessReturns.exe+7957B0
+
+assert(AliceMadnessReturns.exe+7957AA, 55 8B EC 83 EC 48)
+AliceMadnessReturns.exe+7957AA:
+  jmp amr_curve_hook
+  nop
+
+
+// === Crash 1 (lower level): per-iteration over-read save ===
+// Stock loop runs N+2 iterations; the dangerous `movaps xmm4,[ecx+0x60]`
+// at +0x795930 reads past the array end on iter N+2 (where ecx == esi+0x50).
+// Fix: replace the speculative skip-the-load logic with one that also
+// skips when ecx &gt; esi, not just ecx == esi. Vanilla back-edge unchanged
+// so iter count is preserved (no missing output sample, no hair glitch).
+//
+// Now somewhat redundant given the upper-level hook at +0x7957AA which
+// catches every animation tick (one log entry per ~312 over-reads). Kept
+// because it's still the actual crash-prevention patch (the upper hook
+// is just observational), and because the per-save data is occasionally
+// useful for spotting outlier ECX/ESI values.
+//
+// On the ecx &gt; esi path, log a save event (site_id=4) and bump a counter.
+alloc(amr_curve_save_count, 4)
+registersymbol(amr_curve_save_count)
+amr_curve_save_count:
+  dd 0
+
+alloc(amr_curve_save_logic, 0x180, AliceMadnessReturns.exe+795922)
+label(amr_save_skip)
+label(amr_save_normal)
+label(amr_save_no_av)
+label(amr_vq_do_query)
+label(amr_vq_check_state)
+label(amr_save_seh)
+label(amr_save_fault)
+label(amr_save_fault_noclean)
+
+amr_curve_save_logic:
+  cmp ecx, esi
+  jb amr_save_normal           // ecx &lt; esi: normal path
+  je amr_save_skip             // ecx == esi: silent skip (intended)
+  // ecx &gt; esi: would-have-crashed in vanilla iff trailing page is unmapped.
+  inc dword ptr [amr_curve_save_count]
+  pushfd
+  pushad
+  lea eax, [ecx+60]            // addr we'd be reading
+  // ── Cache check: is this address inside the last queried region? ──
+  mov edx, [amr_vq_last_size]
+  test edx, edx
+  jz amr_vq_do_query           // cache empty -&gt; full VQ
+  mov ebx, [amr_vq_last_base]
+  cmp eax, ebx
+  jb amr_vq_do_query           // addr &lt; base
+  add ebx, edx
+  cmp eax, ebx
+  jae amr_vq_do_query          // addr &gt;= base+size
+  // cache hit
+  inc dword ptr [amr_vq_cache_hits]
+  mov eax, [amr_vq_last_state]
+  jmp amr_vq_check_state
+amr_vq_do_query:
+  inc dword ptr [amr_vq_cache_misses]
+  push 1C
+  push amr_vq_buf
+  push eax
+  call kernel32.VirtualQuery   // stdcall
+  // Update cache from buffer: BaseAddress(+0), RegionSize(+0xC), State(+0x10)
+  mov eax, [amr_vq_buf+00]
+  mov [amr_vq_last_base], eax
+  mov eax, [amr_vq_buf+0C]
+  mov [amr_vq_last_size], eax
+  mov eax, [amr_vq_buf+10]
+  mov [amr_vq_last_state], eax
+amr_vq_check_state:
+  cmp eax, 1000                // MEM_COMMIT
+  je amr_save_no_av
+  // AV detected: vanilla would have crashed on this batch's over-read.
+  // Rare relative to the per-batch save rate, so safe to log to ring.
+  inc dword ptr [amr_curve_av_batches]
+  // NB: push from pushad-saved ECX slot, NOT live ECX. kernel32.VirtualQuery
+  // is stdcall and may clobber EAX/ECX/EDX. ESP here equals "post-pushad"
+  // (VQ's args were cleaned by callee), so [esp+0x18] = saved ECX from
+  // pushad's slot order EDI,ESI,EBP,ESP,EBX,EDX,ECX,EAX.
+  push dword ptr [esp+18]      // bad_value = original ECX (over-read ptr)
+  push 4                       // site_id = 4 (curve over-read AV-prone batch)
+  call amr_log_fn
+  cmp dword ptr [amr_av_call_seen], 0
+  jne amr_save_no_av
+  mov dword ptr [amr_av_call_seen], 1
+  inc dword ptr [amr_curve_av_calls]
+amr_save_no_av:
+  popad
+  popfd
+  jmp amr_save_skip
+amr_save_normal:
+  // Original logic from +0x795926..+0x795933
+  add ecx, 50
+  cmp ecx, esi
+  mov ecx, [ebp-20]
+  je amr_save_skip
+  // Null pre-check avoids VEH interference; SEH catches dangling ptrs
+  cmp ecx, 00010000
+  jb amr_save_fault_noclean
+  push amr_save_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  movaps xmm4, [ecx+60]
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  jmp amr_save_skip
+
+amr_save_seh:
+  mov eax, [esp+0C]
+  lea ecx, [amr_save_fault]
+  mov [eax+000000B8], ecx
+  xor eax, eax
+  ret
+
+amr_save_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_save_fault_noclean:
+  inc dword ptr [amr_curve_save_count]
+amr_save_skip:
+  jmp AliceMadnessReturns.exe+795934
+
+assert(AliceMadnessReturns.exe+795922, 3B CE 74 0E 83 C1 50 3B CE 8B 4D E0 74 04 0F 28 61 60)
+AliceMadnessReturns.exe+795922:
+  jmp amr_curve_save_logic
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+
+
+// === Iterator-family deflection counter ===
+// Shared across all three Crash 2/3 caves so dumpAmrLog can show one
+// number for "how many sentinel-`1` iterator events were deflected".
+alloc(amr_iter_save_count, 4)
+registersymbol(amr_iter_save_count)
+amr_iter_save_count:
+  dd 0
+
+
+// === Crash 2/3: iterator operator++ deref guard at +0xBDA65F ===
+// Original: mov eax,[ecx+04]; mov [edx],eax  (advance current to next)
+// On sentinel ecx&lt;0x10000, log + set *this=NULL.
+assert(AliceMadnessReturns.exe+BDA65F, 8B 41 04 89 02)
+alloc(amr_op_inc_guard, 0x100, AliceMadnessReturns.exe+BDA65F)
+label(amr_op_inc_seh)
+label(amr_op_inc_fault)
+label(amr_op_inc_fault_noclean)
+label(amr_op_inc_resume)
+
+amr_op_inc_guard:
+  cmp ecx, 00010000
+  jb amr_op_inc_fault_noclean
+  push amr_op_inc_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  mov eax, [ecx+04]
+  mov [edx], eax
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  jmp amr_op_inc_resume
+
+amr_op_inc_seh:
+  mov eax, [esp+0C]
+  lea ecx, [amr_op_inc_fault]
+  mov [eax+000000B8], ecx
+  xor eax, eax
+  ret
+
+amr_op_inc_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_op_inc_fault_noclean:
+  inc dword ptr [amr_iter_save_count]
+  mov dword ptr [edx], 00000000
+amr_op_inc_resume:
+  jmp AliceMadnessReturns.exe+BDA664
+
+AliceMadnessReturns.exe+BDA65F:
+  jmp amr_op_inc_guard
+
+
+// === Crash 2/3: iterator operator+= deref guard at +0xBDA69F ===
+// Original: mov edx,[eax+04]; mov [ecx],edx  (inner advance loop body)
+// On sentinel eax&lt;0x10000, log + set *this=NULL + break to fn epilogue.
+assert(AliceMadnessReturns.exe+BDA69F, 8B 50 04 89 11)
+alloc(amr_op_add_guard, 0x100, AliceMadnessReturns.exe+BDA69F)
+label(amr_op_add_seh)
+label(amr_op_add_fault)
+label(amr_op_add_fault_noclean)
+
+amr_op_add_guard:
+  cmp eax, 00010000
+  jb amr_op_add_fault_noclean
+  push amr_op_add_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  mov edx, [eax+04]
+  mov [ecx], edx
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  jmp AliceMadnessReturns.exe+BDA6A4   // continue inner loop
+
+amr_op_add_seh:
+  mov eax, [esp+0C]
+  lea edx, [amr_op_add_fault]
+  mov [eax+000000B8], edx
+  xor eax, eax
+  ret
+
+amr_op_add_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_op_add_fault_noclean:
+  inc dword ptr [amr_iter_save_count]
+  mov dword ptr [ecx], 00000000
+  jmp AliceMadnessReturns.exe+BDA6A4
+
+AliceMadnessReturns.exe+BDA69F:
+  jmp amr_op_add_guard
+
+
+// === Crash 2 call-site guard at +0xBE0F63 (defense in depth) ===
+// Catches `*it` returning sentinel `1` where neither op++ nor op+= ran.
+assert(AliceMadnessReturns.exe+BE0F63, 8B 08 E8 A6 E9 FF FF)
+alloc(amr_iter_guard, 0x100, AliceMadnessReturns.exe+BE0F63)
+label(amr_iter_seh)
+label(amr_iter_fault)
+label(amr_iter_fault_noclean)
+label(amr_iter_back)
+
+amr_iter_guard:
+  cmp eax, 00010000
+  jb amr_iter_fault_noclean
+  push amr_iter_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  mov ecx, [eax]
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  call AliceMadnessReturns.exe+BDF910
+  jmp amr_iter_back
+
+amr_iter_seh:
+  mov eax, [esp+0C]
+  lea ecx, [amr_iter_fault]
+  mov [eax+000000B8], ecx
+  xor eax, eax
+  ret
+
+amr_iter_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_iter_fault_noclean:
+  inc dword ptr [amr_iter_save_count]
+amr_iter_back:
+  jmp AliceMadnessReturns.exe+BE0F6A
+
+AliceMadnessReturns.exe+BE0F63:
+  jmp amr_iter_guard
+  nop
+  nop
+
+
+// === Crash 5: 8-byte MMX over-read at +0x43D2FD (worker thread) ===
+// Function does `movq mm1, [ecx]` reading 8 bytes via MMX, then byte-unpacks
+// with punpcklbw. When the buffer ends ~4 bytes before a page boundary
+// and the next page is uncommitted, the read AVs.
+// Fix: VQ on ECX before the read. If the committed region from ECX has
+// &lt; 8 bytes, substitute mm1 = 0 (zero-fill the partial chunk).
+//
+// Patch site bytes (6 bytes, covers movq mm1,[ecx] + movq mm2,mm0):
+//   0F 6F 09 0F 7F C2
+alloc(amr_mmx_skip_count, 4)
+registersymbol(amr_mmx_skip_count)
+amr_mmx_skip_count:
+  dd 0
+
+alloc(amr_mmx_guard, 0x100, AliceMadnessReturns.exe+43D2FD)
+label(amr_mmx_seh)
+label(amr_mmx_fault)
+label(amr_mmx_fault_noclean)
+label(amr_mmx_resume)
+
+amr_mmx_guard:
+  cmp ecx, 00010000
+  jb amr_mmx_fault_noclean
+  push amr_mmx_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  movq mm1, [ecx]
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  movq mm2, mm0
+  jmp amr_mmx_resume
+
+amr_mmx_seh:
+  mov eax, [esp+0C]
+  lea ecx, [amr_mmx_fault]
+  mov [eax+000000B8], ecx
+  xor eax, eax
+  ret
+
+amr_mmx_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_mmx_fault_noclean:
+  inc dword ptr [amr_mmx_skip_count]
+  pxor mm1, mm1
+  movq mm2, mm0
+amr_mmx_resume:
+  jmp AliceMadnessReturns.exe+43D303
+
+assert(AliceMadnessReturns.exe+43D2FD, 0F 6F 09 0F 7F C2)
+AliceMadnessReturns.exe+43D2FD:
+  jmp amr_mmx_guard
+  nop
+
+
+// === Crash 6: virtual call on corrupt object at +0xFDAAA (worker thread) ===
+// `mov edx,[ecx]; mov eax,[edx+0x108]; push edi; call eax`
+// `[ecx]` is the vtable pointer of an object passed in ECX. When the
+// object has been freed/reused/corrupted, the vtable points to garbage
+// and the second deref AVs (e.g. ECX=0x44FA0000, [ECX]=0xA555D6B9 -&gt;
+// reads at 0xA555D7C1 = bogus).
+// Fix: sanity-check the vtable pointer is in EXE .rdata range before
+// loading the method. If it's out of range, skip the entire virtual
+// call (just continue with `mov eax,[edi+0C]` after).
+//
+// Reproducible scenario noted: pressure plate + shrink/unshrink + Q
+// (time bomb placement) at moment of bomb spawn.
+//
+// Patch site bytes (8 bytes, covers `mov edx,[ecx]` + `mov eax,[edx+108]`):
+//   8B 11 8B 82 08 01 00 00
+alloc(amr_vfp_skip_count, 4)
+registersymbol(amr_vfp_skip_count)
+amr_vfp_skip_count:
+  dd 0
+
+alloc(amr_vfp_guard, 0x80, AliceMadnessReturns.exe+FDAA8)
+label(amr_vfp_bad)
+
+amr_vfp_guard:
+  mov edx, [ecx]
+  cmp edx, 00400000
+  jb amr_vfp_bad
+  cmp edx, 01700000
+  jae amr_vfp_bad
+  // vtable looks legit (in EXE range) — do original load + resume
+  mov eax, [edx+108]
+  jmp AliceMadnessReturns.exe+FDAB0     // resume at `push edi; call eax`
+amr_vfp_bad:
+  inc dword ptr [amr_vfp_skip_count]
+  // Log: push original ECX (corrupt object's `this`) as bad_value.
+  push ecx
+  push 7
+  call amr_log_fn
+  // Skip both `push edi` and `call eax`. ESP unchanged, eax discarded
+  // by the next `mov eax,[edi+0C]` anyway.
+  jmp AliceMadnessReturns.exe+FDAB3
+
+assert(AliceMadnessReturns.exe+FDAA8, 8B 11 8B 82 08 01 00 00)
+AliceMadnessReturns.exe+FDAA8:
+  jmp amr_vfp_guard
+  nop
+  nop
+  nop
+
+
+// === Crash 7: header-prefix deref at +0x819F3A (worker thread, GFx helper) ===
+// Tiny function `mov ecx,[eax-04]; mov edx,[ecx+08]; add eax,-04; push eax;
+// call edx`. Treats [eax-4] as a "header pointer" (vtable) and dispatches
+// `vtable[2]` as a destructor-like virtual call. When eax is page-aligned
+// and the previous page is uncommitted, [eax-4] AVs (e.g. eax=0xC4750000,
+// reads at 0xC474FFFC).
+// Fix: VQ on [eax-04] before the read. If unmapped, skip the entire
+// virtual call (just pop+ret).
+//
+// Patch site bytes (12 bytes, covers 5 instructions):
+//   8B 48 FC 8B 51 08 83 C0 FC 50 FF D2
+alloc(amr_ds_skip_count, 4)
+registersymbol(amr_ds_skip_count)
+amr_ds_skip_count:
+  dd 0
+
+alloc(amr_ds_guard, 0x100, AliceMadnessReturns.exe+819F3A)
+label(amr_ds_seh)
+label(amr_ds_fault)
+label(amr_ds_fault_noclean)
+
+amr_ds_guard:
+  cmp eax, 00010000
+  jb amr_ds_fault_noclean
+  push amr_ds_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  mov ecx, [eax-04]
+  mov edx, [ecx+08]
+  add eax, -04
+  push eax
+  call edx
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  jmp AliceMadnessReturns.exe+819F46
+
+amr_ds_seh:
+  mov eax, [esp+0C]
+  lea ecx, [amr_ds_fault]
+  mov [eax+000000B8], ecx
+  xor eax, eax
+  ret
+
+amr_ds_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_ds_fault_noclean:
+  inc dword ptr [amr_ds_skip_count]
+  jmp AliceMadnessReturns.exe+819F46
+
+assert(AliceMadnessReturns.exe+819F3A, 8B 48 FC 8B 51 08 83 C0 FC 50 FF D2)
+AliceMadnessReturns.exe+819F3A:
+  jmp amr_ds_guard
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+  nop
+
+
+// === Crash 8: linked-list walk with sentinel `1` at +0xE36F7 ===
+// Function at +0xE36B0 walks a list via `[node+0x28]` as the next-pointer.
+// When ECX (current node) holds the sentinel `1`, the load at +0xE36F7
+// (`mov eax,[ecx+28]`) reads at 0x29 and AVs.
+// Same root-cause as Crash 2/3 (sentinel `1` in iterator current/next),
+// just different next-pointer offset and different walk loop. Patch:
+// guard with sentinel check; if bad, simulate end-of-list (EAX=0) so the
+// `je` at +0x4E36FC takes and the loop exits cleanly.
+//
+// Patch site bytes (5 bytes covering mov eax,[ecx+28] + cmp eax,ebx):
+//   8B 41 28 3B C3
+alloc(amr_lw_skip_count, 4)
+registersymbol(amr_lw_skip_count)
+amr_lw_skip_count:
+  dd 0
+
+alloc(amr_lw_guard, 0x100, AliceMadnessReturns.exe+E36F7)
+label(amr_lw_seh)
+label(amr_lw_fault)
+label(amr_lw_fault_noclean)
+
+amr_lw_guard:
+  cmp ecx, 00010000
+  jb amr_lw_fault_noclean
+  push amr_lw_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  mov eax, [ecx+28]
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  cmp eax, ebx
+  jmp AliceMadnessReturns.exe+E36FC
+
+amr_lw_seh:
+  mov eax, [esp+0C]
+  lea ecx, [amr_lw_fault]
+  mov [eax+000000B8], ecx
+  xor eax, eax
+  ret
+
+amr_lw_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_lw_fault_noclean:
+  inc dword ptr [amr_lw_skip_count]
+  xor eax, eax
+  cmp eax, ebx
+  jmp AliceMadnessReturns.exe+E36FC
+
+assert(AliceMadnessReturns.exe+E36F7, 8B 41 28 3B C3)
+AliceMadnessReturns.exe+E36F7:
+  jmp amr_lw_guard
+
+
+// === Crash 9: corrupted-object low-address deref at +0x75183A ===
+// Function walks `this -&gt; [+0x1C] -&gt; [+0x1C]` and dereferences. When the
+// inner pointer is garbage (e.g. EDX=0x00005DC0, well below mappable heap),
+// the `movzx edx, word ptr [edx+ebx*2]` AVs.
+// Worker thread, GFx-related (frames 6-9 in same +0x6B—­subsystem).
+// Fix: low-address sentinel check on EDX. If &lt; 0x10000 (reserved page
+// region), substitute EDX=0 and continue. Downstream `imul/add` produce
+// 0 contribution; later `[edx]` reads at e.g. [esi+0xA0] which is still
+// inside the same valid object.
+//
+// Patch site bytes (8 bytes, covers movzx + imul):
+//   0F B7 14 5A 0F AF 56 0C
+alloc(amr_dl_skip_count, 4)
+registersymbol(amr_dl_skip_count)
+amr_dl_skip_count:
+  dd 0
+
+alloc(amr_dl_guard, 0x100, AliceMadnessReturns.exe+75183A)
+label(amr_dl_seh)
+label(amr_dl_fault)
+label(amr_dl_fault_noclean)
+
+amr_dl_guard:
+  cmp edx, 00010000
+  jb amr_dl_fault_noclean
+  push amr_dl_seh
+  push dword ptr fs:[00000000]
+  mov dword ptr fs:[00000000], esp
+  movzx edx, word ptr [edx+ebx*2]
+  imul edx, [esi+0C]
+  pop dword ptr fs:[00000000]
+  add esp, 04
+  jmp AliceMadnessReturns.exe+751842
+
+amr_dl_seh:
+  mov eax, [esp+0C]
+  lea edx, [amr_dl_fault]
+  mov [eax+000000B8], edx
+  xor eax, eax
+  ret
+
+amr_dl_fault:
+  pop dword ptr fs:[00000000]
+  add esp, 04
+amr_dl_fault_noclean:
+  inc dword ptr [amr_dl_skip_count]
+  xor edx, edx
+  jmp AliceMadnessReturns.exe+751842
+
+assert(AliceMadnessReturns.exe+75183A, 0F B7 14 5A 0F AF 56 0C)
+AliceMadnessReturns.exe+75183A:
+  jmp amr_dl_guard
+  nop
+  nop
+  nop
+
+
+// === Crash 11: null-this in function at +0xBDF910 (worker thread) ===
+// Function receives `this` in ECX, stores to [ebp-44]. When this==NULL
+// during LoadMap teardown, three sites AV:
+//   +0xBDF920: cmp [eax+08],00  (read)
+//   +0xBDF93E: cmp [eax+08],00  (read)
+//   +0xBDF976: mov [edx+08],eax (write)
+// Fix: null-check at entry (+0xBDF916). If this==NULL, skip the
+// entire function body and return via epilogue at +0xBDF9F1.
+//
+// Patch site bytes (7 bytes, covers mov [ebp-44],ecx + mov byte [ebp-01],00):
+//   89 4D BC C6 45 FF 00
+alloc(amr_np_skip_count, 4)
+registersymbol(amr_np_skip_count)
+amr_np_skip_count:
+  dd 0
+
+alloc(amr_np_guard, 0x80, AliceMadnessReturns.exe+BDF916)
+label(amr_np_bail)
+
+amr_np_guard:
+  mov [ebp-44], ecx
+  test ecx, ecx
+  jz amr_np_bail
+  mov byte ptr [ebp-01], 00
+  jmp AliceMadnessReturns.exe+BDF91D
+amr_np_bail:
+  inc dword ptr [amr_np_skip_count]
+  jmp AliceMadnessReturns.exe+BDF9F1
+
+assert(AliceMadnessReturns.exe+BDF916, 89 4D BC C6 45 FF 00)
+AliceMadnessReturns.exe+BDF916:
+  jmp amr_np_guard
+  nop
+  nop
+
+
+// === Crash 10: vtable[N] points to garbage at +0x1316A6 ===
+// `mov eax, [edx+0x278]; call eax`  -- loads a method pointer from a vtable
+// slot and calls it. When the vtable is corrupt (slot value is garbage like
+// 0x39140029, outside the EXE), execution jumps into junk and AVs.
+//
+// Crash 6's patch only validated the vtable pointer (EDX); this site needs
+// to validate the LOADED FUNCTION POINTER (EAX) before `call eax`.
+//
+// Caller pushed an arg via `push eax` at +0x1316A5 (before our patch site),
+// expecting stdcall callee cleanup. If we skip the call, we must `add esp,4`
+// to balance.
+//
+// Patch site bytes (8 bytes covering load + call):
+//   8B 82 78 02 00 00 FF D0
+alloc(amr_vc_skip_count, 4)
+registersymbol(amr_vc_skip_count)
+amr_vc_skip_count:
+  dd 0
+
+alloc(amr_vc_guard, 0x80, AliceMadnessReturns.exe+1316A6)
+label(amr_vc_bad)
+
+amr_vc_guard:
+  mov eax, [edx+00000278]
+  cmp eax, 00400000
+  jb amr_vc_bad
+  cmp eax, 01700000
+  jae amr_vc_bad
+  // valid -- call as normal
+  call eax
+  jmp AliceMadnessReturns.exe+1316AE
+amr_vc_bad:
+  // EAX is the bogus function pointer. Save it for the log.
+  // First, balance the stack: caller pushed an arg expecting stdcall cleanup.
+  add esp, 4
+  inc dword ptr [amr_vc_skip_count]
+  push eax                       // bad_value = bogus fn ptr
+  push 0B                        // site_id = 11
+  call amr_log_fn
+  jmp AliceMadnessReturns.exe+1316AE
+
+assert(AliceMadnessReturns.exe+1316A6, 8B 82 78 02 00 00 FF D0)
+AliceMadnessReturns.exe+1316A6:
+  jmp amr_vc_guard
+  nop
+  nop
+  nop
+
+
+// === Lua reader installed on enable ===
+// Run dumpAmrLog() in the CE Lua console any time to dump captured hits.
+{$lua}
+-- Module-level focus-safe log helper. Writes:
+--   (1) to a file with io.flush() after every line (crash-resistant — if
+--       AMR kernel-kills via unhandled AV, the file still contains every
+--       line we've emitted up to ~1 line ago, modulo OS page cache)
+--   (2) to the Lua Engine memo via direct mOutput append (no Show() so
+--       focus is not stolen)
+-- Falls back to print() only when the memo handle isn't reachable.
+--
+-- File path is fixed at the .claude bridge dir so the host agent can grep
+-- it from outside. Open lazily, kept open for session lifetime; closed in
+-- amrLogClose() called from the [DISABLE] section.
+_G.amrLogPath   = _G.amrLogPath   or ((os.getenv("USERPROFILE") or ".") .. "\\Documents\\My Cheat Tables\\.claude\\amr-events.log")
+_G.amrLogHandle = _G.amrLogHandle or nil
+function amrLogEnsure()
+  if _G.amrLogHandle then return _G.amrLogHandle end
+  local f, err = io.open(_G.amrLogPath, "ab")
+  if f then
+    _G.amrLogHandle = f
+    -- Marker so we can see session boundaries in the file
+    f:write(string.format("\n=== amrOut session start %s ===\n", os.date("%Y-%m-%d %H:%M:%S")))
+    f:flush()
+  else
+    -- Don't spam — print once. Subsequent calls will just skip file write.
+    if not _G.amrLogFileErrLogged then
+      print("[amrOut] could not open log file: " .. tostring(err))
+      _G.amrLogFileErrLogged = true
+    end
+  end
+  return _G.amrLogHandle
+end
+function amrLogClose()
+  if _G.amrLogHandle then
+    pcall(function() _G.amrLogHandle:close() end)
+    _G.amrLogHandle = nil
+  end
+end
+function amrOut(msg)
+  -- (1) File write with flush. Wrapped in pcall so file errors never break
+  -- the hook poller. We retry-open if the handle was lost.
+  local f = amrLogEnsure()
+  if f then
+    pcall(function()
+      f:write(msg, "\n")
+      f:flush()
+    end)
+  end
+  -- (2) CE Lua Engine memo (visual / interactive)
+  local ok, le = pcall(getLuaEngine)
+  if ok and le and le.mOutput then
+    pcall(function() le.mOutput.Lines.Add(msg) end)
+  else
+    print(msg)
+  end
+end
+amrSeenSigs   = amrSeenSigs   or {}
+amrPulledLog  = amrPulledLog  or {}
+amrPulledTotal = amrPulledTotal or 0
+amrLastCurveCount = amrLastCurveCount or 0
+amrLastSaveCount  = amrLastSaveCount  or 0
+amrLastIterCount    = amrLastIterCount    or 0
+amrLastAvCalls      = amrLastAvCalls      or 0
+amrLastAvBatches    = amrLastAvBatches    or 0
+amrLastVqHits       = amrLastVqHits       or 0
+amrLastVqMisses     = amrLastVqMisses     or 0
+amrLastMmxSkips     = amrLastMmxSkips     or 0
+amrLastVfpSkips     = amrLastVfpSkips     or 0
+amrLastDsSkips      = amrLastDsSkips      or 0
+amrLastLwSkips      = amrLastLwSkips      or 0
+amrLastDlSkips      = amrLastDlSkips      or 0
+amrLastVcSkips      = amrLastVcSkips      or 0
+local AMR_PULLED_MAX = 5000
+
+function clearAmrSeen()
+  amrSeenSigs = {}
+  print("amr_log: seen-callstacks set cleared.")
+end
+
+-- Pull any new ring-buffer entries from the game into a Lua-side store.
+-- Survives game quit (Lua state outlives the process). Returns count
+-- of new entries appended.
+function pullAmrLog()
+  local buf = getAddress("amr_log_buf")
+  if not buf or buf == 0 then return 0, "no_attach" end
+  local total = readInteger(buf)
+  if not total then return 0, "read_fail" end
+  local curveSym = getAddress("amr_curve_count")
+  local saveSym  = getAddress("amr_curve_save_count")
+  local iterSym  = getAddress("amr_iter_save_count")
+  if curveSym and curveSym ~= 0 then
+    amrLastCurveCount = readInteger(curveSym) or amrLastCurveCount
+  end
+  if saveSym and saveSym ~= 0 then
+    amrLastSaveCount = readInteger(saveSym) or amrLastSaveCount
+  end
+  if iterSym and iterSym ~= 0 then
+    amrLastIterCount = readInteger(iterSym) or amrLastIterCount
+  end
+  local avCallsSym = getAddress("amr_curve_av_calls")
+  if avCallsSym and avCallsSym ~= 0 then
+    amrLastAvCalls = readInteger(avCallsSym) or amrLastAvCalls
+  end
+  local avBatchesSym = getAddress("amr_curve_av_batches")
+  if avBatchesSym and avBatchesSym ~= 0 then
+    amrLastAvBatches = readInteger(avBatchesSym) or amrLastAvBatches
+  end
+  local hitsSym = getAddress("amr_vq_cache_hits")
+  if hitsSym and hitsSym ~= 0 then
+    amrLastVqHits = readInteger(hitsSym) or amrLastVqHits
+  end
+  local missesSym = getAddress("amr_vq_cache_misses")
+  if missesSym and missesSym ~= 0 then
+    amrLastVqMisses = readInteger(missesSym) or amrLastVqMisses
+  end
+  local mmxSym = getAddress("amr_mmx_skip_count")
+  if mmxSym and mmxSym ~= 0 then
+    amrLastMmxSkips = readInteger(mmxSym) or amrLastMmxSkips
+  end
+  local vfpSym = getAddress("amr_vfp_skip_count")
+  if vfpSym and vfpSym ~= 0 then
+    amrLastVfpSkips = readInteger(vfpSym) or amrLastVfpSkips
+  end
+  local dsSym = getAddress("amr_ds_skip_count")
+  if dsSym and dsSym ~= 0 then
+    amrLastDsSkips = readInteger(dsSym) or amrLastDsSkips
+  end
+  local lwSym = getAddress("amr_lw_skip_count")
+  if lwSym and lwSym ~= 0 then
+    amrLastLwSkips = readInteger(lwSym) or amrLastLwSkips
+  end
+  local dlSym = getAddress("amr_dl_skip_count")
+  if dlSym and dlSym ~= 0 then
+    amrLastDlSkips = readInteger(dlSym) or amrLastDlSkips
+  end
+  local vcSym = getAddress("amr_vc_skip_count")
+  if vcSym and vcSym ~= 0 then
+    amrLastVcSkips = readInteger(vcSym) or amrLastVcSkips
+  end
+  if total &lt;= amrPulledTotal then return 0, "no_new" end
+  -- Ring holds only last 256; pull at most that many.
+  local startIdx = math.max(amrPulledTotal, total - 256)
+  local pulled = 0
+  for hit = startIdx, total - 1 do
+    local entry = buf + 0x10 + (hit % 256) * 0x40
+    local e = {
+      hit   = hit,
+      site  = readInteger(entry+4)  or 0,
+      badv  = readInteger(entry+8)  or 0,
+      rip   = readInteger(entry+0xC) or 0,
+      stack = {},
+    }
+    for j = 0, 11 do e.stack[j+1] = readInteger(entry + 0x10 + j*4) or 0 end
+    amrPulledLog[#amrPulledLog+1] = e
+    pulled = pulled + 1
+  end
+  amrPulledTotal = total
+  -- Cap pulled-log size; drop oldest.
+  if #amrPulledLog &gt; AMR_PULLED_MAX then
+    local drop = #amrPulledLog - AMR_PULLED_MAX
+    for i = 1, AMR_PULLED_MAX do amrPulledLog[i] = amrPulledLog[i + drop] end
+    for i = AMR_PULLED_MAX + 1, #amrPulledLog do amrPulledLog[i] = nil end
+  end
+  return pulled
+end
+
+-- 5-second background timer, auto-pulling from the ring into amrPulledLog.
+if amrTimer then amrTimer.Enabled = false; amrTimer.destroy(); amrTimer = nil end
+amrTimer = createTimer(getMainForm(), false)
+-- 1s timer is a balance: fast enough that the 64-entry ring rarely loses
+-- AV entries to eviction (peak ~60 AVs/sec means &lt; 1 ring-fill per tick),
+-- slow enough that pull cost is negligible.
+amrTimer.Interval = 1000
+amrLastReportedAvCalls = amrLastReportedAvCalls or 0
+amrTimer.OnTimer = function(t)
+  -- Process-alive guard: if AMR exited, stop polling silently. Avoids
+  -- "Failure allocating memory near 000A0000" spam from CE's AA trying
+  -- to resolve dead-module symbols.
+  if not amrProcessAlive() then
+    t.Enabled = false
+    print(os.date("%H:%M:%S ") .. "[amr] Process gone — timer stopped, unticking entry.")
+    local mr = getAddressList().getMemoryRecordByID(0)
+    if mr then mr.Active = false end
+    return
+  end
+  pcall(pullAmrLog)
+  -- Eviction-detect: if cave flagged "an AV entry was about to be lost",
+  -- it means our pull missed at least one. Auto-dump silently (memo append).
+  local pendSym = getAddress("amr_pending_pull")
+  if pendSym and pendSym ~= 0 then
+    local pending = readInteger(pendSym) or 0
+    if pending ~= 0 then
+      writeInteger(pendSym, 0)
+      -- Eviction can be chronic during AV-heavy scenes; the ring fills,
+      -- and overwriting already-pulled entries doesn't actually lose data.
+      -- Auto-dump only when there's a NEW callstack we haven't shown yet
+      -- (onlyIfNew=true). Steady-state spam stays out of the memo.
+      pcall(function() dumpAmrLog(false, true) end)
+    end
+  end
+  -- Per-tick ping if new AV outer calls accumulated since last report.
+  if amrLastAvCalls and amrLastAvCalls > amrLastReportedAvCalls then
+    local delta = amrLastAvCalls - amrLastReportedAvCalls
+    amrOut(string.format(
+      "[amr] !!! %d new would-have-AV'd outer call(s) (total now: %d / %d, %d batch-level)",
+      delta, amrLastAvCalls, amrLastCurveCount, amrLastAvBatches))
+    amrLastReportedAvCalls = amrLastAvCalls
+    pcall(function() dumpAmrLog(false, true) end)
+  end
+end
+amrTimer.Enabled = true
+
+function dumpAmrLog(reset, onlyIfNew)
+  if reset == nil then reset = true end
+  if onlyIfNew == nil then onlyIfNew = false end
+  local base = getAddress("AliceMadnessReturns.exe")
+  -- Pull fresh first so quit-survivable store is up-to-date.
+  local pulled = pullAmrLog() or 0
+  -- Pre-pass: build groups and figure out how many are NEW (unseen). When
+  -- onlyIfNew is set and there are no new groups, we skip ALL printing.
+  -- This keeps the auto-dump quiet during chronic eviction of already-seen
+  -- callstacks while still firing when something genuinely new shows up.
+  local site_name = {
+    [1]="op++ +0xBDA65F",
+    [2]="op+= +0xBDA69F",
+    [3]="callsite +0xBE0F63",
+    [4]="curve over-read +0x795922 (per-iter, lower level)",
+    [5]="curve eval entry +0x7957AA (per-call, upper level)",
+    [6]="MMX over-read +0x43D2FD (Crash 5, bad=ECX)",
+    [7]="vtable corrupt +0xFDAA8 (Crash 6, bad=ECX `this`)",
+    [8]="header-prefix +0x819F3A (Crash 7, bad=EAX)",
+    [9]="linked walk sentinel +0xE36F7 (Crash 8, bad=ECX)",
+    [0xA]="object deref low-addr +0x75183A (Crash 9, bad=EDX)",
+    [0xB]="vtable[N] garbage +0x1316A6 (Crash 10, bad=fn-ptr)",
+  }
+  local exeSize = (getModuleSize and base and getModuleSize("AliceMadnessReturns.exe")) or 0x1700000
+  local function isExe(v)
+    return base and v and v &gt;= base and v &lt; base + exeSize
+  end
+  local function rva(v)
+    if isExe(v) then return string.format(" (+0x%X)", v - base) else return "" end
+  end
+  local groups, order = {}, {}
+  for _, e in ipairs(amrPulledLog) do
+    local sig_parts = { tostring(e.site) }
+    if isExe(e.rip) then sig_parts[#sig_parts+1] = string.format("%X", e.rip) end
+    for _, v in ipairs(e.stack) do
+      if isExe(v) then sig_parts[#sig_parts+1] = string.format("%X", v) end
+    end
+    local sig = table.concat(sig_parts, ",")
+    local g = groups[sig]
+    if not g then
+      g = { count = 0, site = e.site, rip = e.rip, badv = e.badv, stack = e.stack }
+      groups[sig] = g
+      order[#order+1] = sig
+    end
+    g.count = g.count + 1
+  end
+  table.sort(order, function(a, b) return groups[a].count &gt; groups[b].count end)
+  local newOrder = {}
+  local hiddenGroups, hiddenEntries = 0, 0
+  for _, sig in ipairs(order) do
+    if amrSeenSigs[sig] then
+      hiddenGroups = hiddenGroups + 1
+      hiddenEntries = hiddenEntries + groups[sig].count
+    else
+      newOrder[#newOrder+1] = sig
+    end
+  end
+
+  -- Skip the entire dump (incl. summary) if caller asked for "only when
+  -- new" and nothing new accumulated. Reset still runs if requested.
+  if onlyIfNew and #newOrder == 0 then
+    if reset then
+      local b = getAddress("amr_log_buf")
+      if b and b ~= 0 then writeInteger(b, 0) end
+      local cs = getAddress("amr_curve_count");      if cs and cs ~= 0 then writeInteger(cs, 0) end
+      local ss = getAddress("amr_curve_save_count"); if ss and ss ~= 0 then writeInteger(ss, 0) end
+      local is = getAddress("amr_iter_save_count");  if is and is ~= 0 then writeInteger(is, 0) end
+      local avc = getAddress("amr_curve_av_calls");   if avc and avc ~= 0 then writeInteger(avc, 0) end
+      local avb = getAddress("amr_curve_av_batches"); if avb and avb ~= 0 then writeInteger(avb, 0) end
+      local avs = getAddress("amr_av_call_seen");     if avs and avs ~= 0 then writeInteger(avs, 0) end
+      local vh = getAddress("amr_vq_cache_hits");     if vh and vh ~= 0 then writeInteger(vh, 0) end
+      local vm = getAddress("amr_vq_cache_misses");   if vm and vm ~= 0 then writeInteger(vm, 0) end
+      local mx = getAddress("amr_mmx_skip_count");    if mx and mx ~= 0 then writeInteger(mx, 0) end
+      local vf = getAddress("amr_vfp_skip_count");    if vf and vf ~= 0 then writeInteger(vf, 0) end
+      local ds = getAddress("amr_ds_skip_count");     if ds and ds ~= 0 then writeInteger(ds, 0) end
+      local lw = getAddress("amr_lw_skip_count");     if lw and lw ~= 0 then writeInteger(lw, 0) end
+      local dl = getAddress("amr_dl_skip_count");     if dl and dl ~= 0 then writeInteger(dl, 0) end
+      local vc = getAddress("amr_vc_skip_count");     if vc and vc ~= 0 then writeInteger(vc, 0) end
+      amrPulledLog = {}
+      amrPulledTotal = 0
+      amrLastCurveCount = 0; amrLastSaveCount = 0; amrLastIterCount = 0; amrLastMmxSkips = 0
+      amrLastAvCalls = 0; amrLastAvBatches = 0; amrLastVqHits = 0; amrLastVqMisses = 0
+    end
+    return
+  end
+
+  if pulled &gt; 0 then
+    amrOut(string.format("[amr] pulled %d new entries before dump.", pulled))
+  end
+  amrOut(string.format("=== amr_log: stored=%d, curve-calls=%d, curve over-reads=%d, iter-sentinel=%d, mmx=%d, vfp=%d, ds=%d, lw=%d, dl=%d, vc=%d ===",
+    #amrPulledLog, amrLastCurveCount, amrLastSaveCount, amrLastIterCount, amrLastMmxSkips, amrLastVfpSkips, amrLastDsSkips, amrLastLwSkips, amrLastDlSkips, amrLastVcSkips))
+  amrOut(string.format("    would-have-AV'd: %d / %d outer calls (%.4f%%); %d / %d batches (%.4f%%)",
+    amrLastAvCalls, amrLastCurveCount,
+    amrLastCurveCount &gt; 0 and (100 * amrLastAvCalls / amrLastCurveCount) or 0,
+    amrLastAvBatches, amrLastSaveCount,
+    amrLastSaveCount &gt; 0 and (100 * amrLastAvBatches / amrLastSaveCount) or 0))
+  local vqTotal = amrLastVqHits + amrLastVqMisses
+  amrOut(string.format("    VQ cache: %d hits / %d misses (%.2f%% hit rate, %d total VQ syscalls)",
+    amrLastVqHits, amrLastVqMisses,
+    vqTotal &gt; 0 and (100 * amrLastVqHits / vqTotal) or 0,
+    amrLastVqMisses))
+  if reset then
+    amrOut("    (counters/store will be reset after this dump; call dumpAmrLog(false) to keep them)")
+  else
+    amrOut("    (counters/store preserved)")
+  end
+  if #amrPulledLog == 0 then
+    if reset then
+      local buf = getAddress("amr_log_buf")
+      if buf and buf ~= 0 then writeInteger(buf, 0) end
+      local cs = getAddress("amr_curve_count");      if cs and cs ~= 0 then writeInteger(cs, 0) end
+      local ss = getAddress("amr_curve_save_count"); if ss and ss ~= 0 then writeInteger(ss, 0) end
+      local is = getAddress("amr_iter_save_count");  if is and is ~= 0 then writeInteger(is, 0) end
+      local avc = getAddress("amr_curve_av_calls");   if avc and avc ~= 0 then writeInteger(avc, 0) end
+      local avb = getAddress("amr_curve_av_batches"); if avb and avb ~= 0 then writeInteger(avb, 0) end
+      local avs = getAddress("amr_av_call_seen");     if avs and avs ~= 0 then writeInteger(avs, 0) end
+      local vh = getAddress("amr_vq_cache_hits");     if vh and vh ~= 0 then writeInteger(vh, 0) end
+      local vm = getAddress("amr_vq_cache_misses");   if vm and vm ~= 0 then writeInteger(vm, 0) end
+      local mx = getAddress("amr_mmx_skip_count");    if mx and mx ~= 0 then writeInteger(mx, 0) end
+      local vf = getAddress("amr_vfp_skip_count");    if vf and vf ~= 0 then writeInteger(vf, 0) end
+      local ds = getAddress("amr_ds_skip_count");     if ds and ds ~= 0 then writeInteger(ds, 0) end
+      local lw = getAddress("amr_lw_skip_count");     if lw and lw ~= 0 then writeInteger(lw, 0) end
+      local dl = getAddress("amr_dl_skip_count");     if dl and dl ~= 0 then writeInteger(dl, 0) end
+      local vc = getAddress("amr_vc_skip_count");     if vc and vc ~= 0 then writeInteger(vc, 0) end
+      amrPulledTotal = 0; amrLastCurveCount = 0; amrLastSaveCount = 0; amrLastIterCount = 0; amrLastAvCalls = 0; amrLastAvBatches = 0; amrLastVqHits = 0; amrLastVqMisses = 0; amrLastMmxSkips = 0; amrLastVfpSkips = 0; amrLastDsSkips = 0; amrLastLwSkips = 0; amrLastDlSkips = 0; amrLastVcSkips = 0
+    end
+    return
+  end
+
+  amrOut(string.format("Grouped: %d unique callstack(s) across %d stored entries (%d new, %d already-seen).",
+    #order, #amrPulledLog, #newOrder, hiddenGroups))
+  if hiddenGroups &gt; 0 then
+    amrOut(string.format("    (%d entries matching %d already-seen callstack(s) hidden; clearAmrSeen() to forget)",
+      hiddenEntries, hiddenGroups))
+  end
+  for i, sig in ipairs(newOrder) do
+    local g = groups[sig]
+    amrOut(string.format("[group %d] count=%d  site=%s  bad=%08X  caller=%08X%s",
+      i, g.count, site_name[g.site] or ("?"..g.site), g.badv, g.rip, rva(g.rip)))
+    for j, v in ipairs(g.stack) do
+      if v ~= 0 then
+        amrOut(string.format("    [+%02X] %08X%s", (j-1)*4, v, rva(v)))
+      end
+    end
+    amrSeenSigs[sig] = true
+  end
+
+  if reset then
+    local buf = getAddress("amr_log_buf")
+    if buf and buf ~= 0 then writeInteger(buf, 0) end
+    local cs = getAddress("amr_curve_count");      if cs and cs ~= 0 then writeInteger(cs, 0) end
+    local ss = getAddress("amr_curve_save_count"); if ss and ss ~= 0 then writeInteger(ss, 0) end
+    amrPulledLog = {}
+    amrPulledTotal = 0
+    amrLastCurveCount = 0
+    amrLastSaveCount = 0
+    amrLastIterCount = 0
+    amrLastAvCalls = 0
+    amrLastAvBatches = 0
+    amrLastVqHits = 0
+    amrLastVqMisses = 0
+    amrLastMmxSkips = 0
+    amrLastVfpSkips = 0
+    amrLastDsSkips = 0
+    amrLastLwSkips = 0
+    amrLastDlSkips = 0
+    amrLastVcSkips = 0
+  end
+end
+print("dumpAmrLog() / clearAmrSeen() / pullAmrLog() registered. Auto-pull every 5s.")
+{$asm}
+
+
+[DISABLE]
+
+{$lua}
+if amrTimer then amrTimer.Enabled = false; amrTimer.destroy(); amrTimer = nil end
+dumpAmrLog = nil
+pullAmrLog = nil
+clearAmrSeen = nil
+
+-- Guard: if process is gone, only do symbol cleanup (no byte-restore or dealloc)
+local process_alive = amrProcessAlive()
+
+if process_alive then
+  local ok, err = pcall(function()
+    autoAssemble([[
+AliceMadnessReturns.exe+79593C:
+  db 60
+
+AliceMadnessReturns.exe+795922:
+  db 3B CE 74 0E 83 C1 50 3B CE 8B 4D E0 74 04 0F 28 61 60
+
+AliceMadnessReturns.exe+7957AA:
+  db 55 8B EC 83 EC 48
+
+AliceMadnessReturns.exe+BDA65F:
+  db 8B 41 04 89 02
+
+AliceMadnessReturns.exe+BDA69F:
+  db 8B 50 04 89 11
+
+AliceMadnessReturns.exe+BE0F63:
+  db 8B 08 E8 A6 E9 FF FF
+
+AliceMadnessReturns.exe+43D2FD:
+  db 0F 6F 09 0F 7F C2
+
+AliceMadnessReturns.exe+FDAA8:
+  db 8B 11 8B 82 08 01 00 00
+
+AliceMadnessReturns.exe+819F3A:
+  db 8B 48 FC 8B 51 08 83 C0 FC 50 FF D2
+
+AliceMadnessReturns.exe+E36F7:
+  db 8B 41 28 3B C3
+
+AliceMadnessReturns.exe+75183A:
+  db 0F B7 14 5A 0F AF 56 0C
+
+AliceMadnessReturns.exe+1316A6:
+  db 8B 82 78 02 00 00 FF D0
+
+AliceMadnessReturns.exe+BDF916:
+  db 89 4D BC C6 45 FF 00
+
+dealloc(amr_op_inc_guard)
+dealloc(amr_op_add_guard)
+dealloc(amr_iter_guard)
+dealloc(amr_iter_save_count)
+dealloc(amr_log_fn)
+dealloc(amr_log_buf)
+dealloc(amr_curve_hook)
+dealloc(amr_curve_count)
+dealloc(amr_curve_save_logic)
+dealloc(amr_curve_save_count)
+dealloc(amr_av_call_seen)
+dealloc(amr_curve_av_calls)
+dealloc(amr_curve_av_batches)
+dealloc(amr_vq_buf)
+dealloc(amr_vq_last_base)
+dealloc(amr_vq_last_size)
+dealloc(amr_vq_last_state)
+dealloc(amr_vq_cache_hits)
+dealloc(amr_vq_cache_misses)
+dealloc(amr_mmx_guard)
+dealloc(amr_mmx_skip_count)
+dealloc(amr_mmx_vq_buf)
+dealloc(amr_pending_pull)
+dealloc(amr_vfp_guard)
+dealloc(amr_vfp_skip_count)
+dealloc(amr_ds_guard)
+dealloc(amr_ds_skip_count)
+dealloc(amr_ds_vq_buf)
+dealloc(amr_lw_guard)
+dealloc(amr_lw_skip_count)
+dealloc(amr_dl_guard)
+dealloc(amr_dl_skip_count)
+dealloc(amr_vc_guard)
+dealloc(amr_vc_skip_count)
+dealloc(amr_np_guard)
+dealloc(amr_np_skip_count)
+    ]])
+  end)
+  if not ok then
+    print("[amr] Byte-restore failed (process may be closing): " .. tostring(err))
+  end
+else
+  print(os.date("%H:%M:%S ") .. "[amr] Process gone — skipping byte restore and deallocs.")
+end
+
+-- Symbol cleanup always runs (these are CE-side, not process-side)
+local syms = {
+  "amr_log_buf", "amr_log_fn", "amr_curve_count", "amr_curve_save_count",
+  "amr_iter_save_count", "amr_av_call_seen", "amr_curve_av_calls",
+  "amr_curve_av_batches", "amr_vq_cache_hits", "amr_vq_cache_misses",
+  "amr_mmx_skip_count", "amr_pending_pull", "amr_vfp_skip_count",
+  "amr_ds_skip_count", "amr_lw_skip_count", "amr_dl_skip_count",
+  "amr_vc_skip_count", "amr_np_skip_count",
+}
+for _, s in ipairs(syms) do
+  pcall(unregisterSymbol, s)
+end
+
+</AssemblerScript>
+    </CheatEntry>
+    <CheatEntry>
+      <ID>7</ID>
+      <Description>"Kill Zombie Breakable Object (Fix World 5 Rolling Ball Load 3 Crash)"</Description>
+      <VariableType>Auto Assembler Script</VariableType>
+      <AssemblerScript>{ Kill Zombie Breakable Object — Fix Rolling Ball Load 3 Crash
+  Chapter 5 World 3 rolling ball puzzle: transitioning through the
+  door from puzzle 2 to puzzle 3 loads Chapter5_W3_HH2_03. During
+  the load, a GameBreakableActor's collision component gets added to
+  the physics tick iteration list BEFORE InitComponentRBPhys runs.
+  The object has RF_PendingKill | RF_AsyncLoading — a zombie that
+  will never initialize and never be removed. Setting MadnessPatch
+  DisableBackgroundLevelStreaming to 0 (use Vanilla Async loading)
+  also seems to fix this bug.
+
+  Vanilla behavior: UE3 appError() formats
+    "%s collisioncomponent %s not initialized deleteme %d"
+  then calls RaiseException(1) → _exit(). Instant process death.
+
+  Fix: hook the not-initialized branch at +0x37E82A. On first hit
+  for any object, set bDeleteMe (bit 7 of ObjectFlags at [obj+0x3C])
+  so the function's own early bDeleteMe check at +0x37E4E8 catches
+  it on subsequent ticks. Log full details via amrOut (file append,
+  no focus steal). Return cleanly via the function epilogue.
+
+  Requires: entry ID 0 ("Fix Crashes") active for amrOut + amrProcessAlive.
+}
+
+[ENABLE]
+
+{$lua}
+if not amrProcessAlive or not amrProcessAlive() then
+  error("[zombie-kill] AMR not attached — activate entry ID 0 first")
+end
+if not amrOut then
+  error("[zombie-kill] amrOut not defined — activate entry ID 0 first")
+end
+
+-- Auto-heal: if our patch is already in place (stale from prior activation),
+-- restore vanilla bytes so the AA assert below succeeds.
+do
+  local base = getAddress("AliceMadnessReturns.exe")
+  local addr = base + 0x37E82A
+  local vanilla = {0x8D, 0x85, 0x10, 0xFF, 0xFF, 0xFF}
+  local first = readByte(addr)
+  if first == 0xE9 then
+    -- Stale patch detected — restore vanilla
+    for i = 1, #vanilla do writeByte(addr + i - 1, vanilla[i]) end
+    amrOut("[zombie-kill] Auto-healed stale patch at +37E82A")
+  elseif first ~= vanilla[1] then
+    local got = ""
+    for i = 0, 5 do got = got .. string.format("%02X ", readByte(addr + i)) end
+    error(string.format("[zombie-kill] Unexpected bytes at +37E82A: [%s], expected vanilla [8D 85 10 FF FF FF]", got))
+  end
+end
+{$asm}
+
+// GNames.Data address for FName resolution in the Lua logger
+alloc(amr_zk_gnames, 4)
+registersymbol(amr_zk_gnames)
+amr_zk_gnames:
+  dd 014723A4
+
+// Flag: set to 1 by the cave when it kills a zombie. Lua polls this.
+alloc(amr_zk_fired, 4)
+registersymbol(amr_zk_fired)
+amr_zk_fired:
+  dd 0
+
+// Last-killed object address (for Lua to read details)
+alloc(amr_zk_last_obj, 4)
+registersymbol(amr_zk_last_obj)
+amr_zk_last_obj:
+  dd 0
+
+// Last-killed RB component address
+alloc(amr_zk_last_rb, 4)
+registersymbol(amr_zk_last_rb)
+amr_zk_last_rb:
+  dd 0
+
+// Old flags before we set bDeleteMe
+alloc(amr_zk_last_oldflags, 4)
+registersymbol(amr_zk_last_oldflags)
+amr_zk_last_oldflags:
+  dd 0
+
+// Caller return address (for callstack context)
+alloc(amr_zk_last_caller, 4)
+registersymbol(amr_zk_last_caller)
+amr_zk_last_caller:
+  dd 0
+
+// Kill count (how many unique objects we've set bDeleteMe on)
+alloc(amr_zk_kill_count, 4)
+registersymbol(amr_zk_kill_count)
+amr_zk_kill_count:
+  dd 0
+
+alloc(amr_zk_cave, 0x80, AliceMadnessReturns.exe+37E82A)
+label(amr_zk_already_dead)
+
+amr_zk_cave:
+  // ESI = owning object, ECX = RB component (from `test byte [ecx+50],01`)
+  // Check if bDeleteMe is already set (bit 7 of [esi+3C])
+  test byte ptr [esi+3C], 80
+  jnz amr_zk_already_dead
+
+  // === First encounter: kill the zombie ===
+  // Save old flags, object, RB, caller for Lua to read
+  push eax
+  mov eax, [esi+3C]
+  mov [amr_zk_last_oldflags], eax
+  // Set bDeleteMe: OR bit 7 into flags
+  or eax, 00000080
+  mov [esi+3C], eax
+  pop eax
+  mov [amr_zk_last_obj], esi
+  mov [amr_zk_last_rb], ecx
+  // Capture caller EIP from stack. Our cave was reached via:
+  //   original site JMP -> cave. The return address of the FUNCTION
+  //   is at [ebp+04] (standard frame pointer).
+  push eax
+  mov eax, [ebp+04]
+  mov [amr_zk_last_caller], eax
+  pop eax
+  inc dword ptr [amr_zk_kill_count]
+  // Signal Lua
+  mov dword ptr [amr_zk_fired], 1
+
+amr_zk_already_dead:
+  // Clean return via function epilogue (stdcall, ret 0x14)
+  xor eax, eax
+  jmp AliceMadnessReturns.exe+38032F
+
+assert(AliceMadnessReturns.exe+37E82A, 8D 85 10 FF FF FF)
+AliceMadnessReturns.exe+37E82A:
+  jmp amr_zk_cave
+  nop
+
+
+// === Lua poller: watch for kills and log full details ===
+{$lua}
+do
+  -- GNames resolver (found this session: GNames.Data at [0x014723A4])
+  local base = getAddress("AliceMadnessReturns.exe")
+  local gnames_global = base + 0x10723A4  -- RVA of GNames.Data pointer
+
+  local function resolveFName(idx)
+    if not idx or idx == 0 then return "None" end
+    local gnames_data = readInteger(gnames_global)
+    if not gnames_data or gnames_data == 0 then return string.format("FName#%d", idx) end
+    local entry = readInteger(gnames_data + idx * 4)
+    if not entry or entry == 0 then return string.format("FName#%d", idx) end
+    return readString(entry + 0x10, 64) or string.format("FName#%d", idx)
+  end
+
+  if amrZkTimer then
+    pcall(function() amrZkTimer.Enabled = false; amrZkTimer.destroy() end)
+    amrZkTimer = nil
+  end
+  amrZkTimer = createTimer(getMainForm(), false)
+  amrZkTimer.Interval = 500
+  amrZkTimer.OnTimer = function(t)
+    if not amrProcessAlive() then
+      t.Enabled = false
+      return
+    end
+    local firedSym = getAddress("amr_zk_fired")
+    if not firedSym or firedSym == 0 then return end
+    local fired = readInteger(firedSym) or 0
+    if fired == 0 then return end
+    writeInteger(firedSym, 0)  -- acknowledge
+
+    local objSym   = getAddress("amr_zk_last_obj")
+    local rbSym    = getAddress("amr_zk_last_rb")
+    local flagsSym = getAddress("amr_zk_last_oldflags")
+    local callerSym = getAddress("amr_zk_last_caller")
+    local countSym  = getAddress("amr_zk_kill_count")
+
+    local obj       = readInteger(objSym) or 0
+    local rb        = readInteger(rbSym) or 0
+    local oldFlags  = readInteger(flagsSym) or 0
+    local caller    = readInteger(callerSym) or 0
+    local killCount = readInteger(countSym) or 0
+    local base      = getAddress("AliceMadnessReturns.exe")
+
+    -- Read object details
+    local obj_vt     = readInteger(obj) or 0
+    local obj_fname  = readInteger(obj + 0x2C) or 0
+    local obj_outer  = readInteger(obj + 0x34) or 0
+    local outer_fname = 0
+    if obj_outer ~= 0 then outer_fname = readInteger(obj_outer + 0x2C) or 0 end
+
+    -- Read RB component details
+    local rb_vt   = readInteger(rb) or 0
+    local rb_init = readBytes(rb + 0x50, 1) or 0
+
+    -- Read caller stack (8 dwords from [ebp+04] area, but we only saved EIP.
+    -- Also grab a few words from the object for context)
+    local obj_10 = readInteger(obj + 0x10) or 0
+    local obj_14 = readInteger(obj + 0x14) or 0
+
+    local newFlags = readInteger(obj + 0x3C) or 0
+    local timestamp = os.date("%H:%M:%S")
+
+    amrOut("======================================================================")
+    amrOut("====== ZOMBIE BREAKABLE OBJECT KILLED ================================")
+    amrOut("======================================================================")
+    amrOut(string.format("  Time:        %s  (kill #%d)", timestamp, killCount))
+    amrOut(string.format("  Action:      Set bDeleteMe (bit 7) on uninitialized collision component owner"))
+    amrOut(string.format("  Object:      %08X  class=%s  vtable=+%06X",
+      obj, resolveFName(obj_fname), obj_vt - base))
+    amrOut(string.format("  Outer:       %08X  name=%s",
+      obj_outer, resolveFName(outer_fname)))
+    amrOut(string.format("  RB Comp:     %08X  vtable=+%06X  init_byte=%02X",
+      rb, rb_vt - base, rb_init))
+    amrOut(string.format("  Flags:       %08X -> %08X  (bDeleteMe: 0 -> 1)", oldFlags, newFlags))
+    amrOut(string.format("  PendingKill: %d  AsyncLoading: %d",
+      math.floor(oldFlags / 0x2000000) % 2,
+      math.floor(oldFlags / 0x8000000) % 2))
+    amrOut(string.format("  Caller EIP:  %08X (+%06X)", caller, caller - base))
+    amrOut(string.format("  [obj+10]:    %08X  [obj+14]: %08X", obj_10, obj_14))
+    amrOut("======================================================================")
+  end
+  amrZkTimer.Enabled = true
+  amrOut("[zombie-kill] Armed — watching for uninitialized collision components")
+end
+{$asm}
+
+
+[DISABLE]
+
+{$lua}
+do
+  if amrZkTimer then
+    pcall(function() amrZkTimer.Enabled = false; amrZkTimer.destroy() end)
+    amrZkTimer = nil
+  end
+  local process_alive = amrProcessAlive and amrProcessAlive()
+  if process_alive then
+    local ok, err = pcall(function()
+      autoAssemble([[
+AliceMadnessReturns.exe+37E82A:
+  db 8D 85 10 FF FF FF
+
+dealloc(amr_zk_cave)
+dealloc(amr_zk_gnames)
+dealloc(amr_zk_fired)
+dealloc(amr_zk_last_obj)
+dealloc(amr_zk_last_rb)
+dealloc(amr_zk_last_oldflags)
+dealloc(amr_zk_last_caller)
+dealloc(amr_zk_kill_count)
+      ]])
+    end)
+    if not ok then
+      local msg = "[zombie-kill] Byte-restore failed: " .. tostring(err)
+      if amrOut then amrOut(msg) else print(msg) end
+    end
+  else
+    local msg = os.date("%H:%M:%S ") .. "[zombie-kill] Process gone — skipping byte restore"
+    if amrOut then amrOut(msg) else print(msg) end
+  end
+  local syms = {
+    "amr_zk_cave", "amr_zk_gnames", "amr_zk_fired", "amr_zk_last_obj",
+    "amr_zk_last_rb", "amr_zk_last_oldflags", "amr_zk_last_caller",
+    "amr_zk_kill_count",
+  }
+  for _, s in ipairs(syms) do
+    if getAddress(s) ~= nil then unregisterSymbol(s) end
+  end
+end
+{$asm}
+</AssemblerScript>
+    </CheatEntry>
+  </CheatEntries>
+  <UserdefinedSymbols/>
+</CheatTable>
