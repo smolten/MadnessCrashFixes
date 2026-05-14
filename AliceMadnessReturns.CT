@@ -3,7 +3,7 @@
   <CheatEntries>
     <CheatEntry>
       <ID>0</ID>
-      <Description>"Fix Crashes: Hair Curve (1) + Linked-List (2) + Worker (3)"</Description>
+      <Description>"Fix Crashes: Hair Curve + Linked-List + Worker + Misc"</Description>
       <VariableType>Auto Assembler Script</VariableType>
       <AssemblerScript>{ Alice: Madness Returns — stock-bug patches with diagnostic logging
   Targets vanilla AliceMadnessReturns.exe (Steam build), tested extensively with MadnessPatch installed.
