@@ -1,6 +1,6 @@
 # MadnessCrashFixes
 
-Cheat Engine table and launcher for **Alice: Madness Returns** (Steam) that fixes several vanilla crash bugs.
+Cheat Engine table and launcher for **Alice: Madness Returns** (Steam) that fixes several crash bugs. These bugs do seem to exist in vanilla, but were also noticed only when using [MadnessPatch](https://github.com/Wemino/MadnessPatch), possibly due to additional memory pressure of the mod installition, or due to the patch's DisableBackgroundLevelStreaming. The only pure-vanilla crash noticed was on "Continue Game", which itself seems fixed by MadnessPatch, and was not studied further.
 
 ## What it fixes
 
