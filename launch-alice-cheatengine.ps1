@@ -14,11 +14,17 @@ if (-not (Test-Path $cePath))   { throw "CE not found at $cePath" }
 if (-not (Test-Path $ctPath))   { throw "CT not found at $ctPath" }
 if (-not (Test-Path $autoSrc))  { throw "autoattach script not found at $autoSrc" }
 
-# Bail if game is already running (avoid double-launch)
+# If game is already running, ask before launching CE
 $existing = Get-Process AliceMadnessReturns -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "AliceMadnessReturns already running (PID $($existing.Id)) — launching CE"
-    Start-Process $cePath
+    Write-Host "AliceMadnessReturns already running (PID $($existing.Id))."
+    $reply = Read-Host "Open Cheat Engine? (y/n)"
+    if ($reply -match '^[yY]') {
+        # Install autoattach so CE picks up the table
+        $luaContent = (Get-Content $autoSrc -Raw -Encoding UTF8) -replace '%%CT_PATH%%', ($ctPath -replace '\\', '\\')
+        [System.IO.File]::WriteAllText($autoDst, $luaContent, [System.Text.UTF8Encoding]::new($false))
+        Start-Process $cePath
+    }
     exit 0
 }
 
