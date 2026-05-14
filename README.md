@@ -63,4 +63,4 @@ Run `launch-alice-cheatengine.ps1` from this directory. It will:
 
 All patches include diagnostic logging to a ring buffer for post-mortem analysis.
 
-See the images in `img/` for annotated crash-site diagrams.
+See the images in `img/` for example crash logs.
