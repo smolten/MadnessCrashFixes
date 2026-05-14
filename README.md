@@ -1,6 +1,7 @@
 # MadnessCrashFixes
+<img width="1280" height="640" alt="four_hundred_thousand" src="https://github.com/user-attachments/assets/eebe31c3-80c0-4887-948a-950f761e81c2" />
 
-Cheat Engine table and launcher for **Alice: Madness Returns** (Steam) that fixes several crash bugs. These bugs do seem to exist in vanilla, but were also noticed only when using [MadnessPatch](https://github.com/Wemino/MadnessPatch), possibly due to additional memory pressure of the mod installation, or in the case of Zombie Object it was due to the patch's DisableBackgroundLevelStreaming.
+Cheat Engine table and launch/hook helper script for **Alice: Madness Returns** (Steam) that fixes several crash bugs. These bugs do seem to exist in vanilla, but were also noticed only when using [MadnessPatch](https://github.com/Wemino/MadnessPatch), possibly due to additional memory pressure of the mod installation, or in the case of Zombie Object it was due to the patch's DisableBackgroundLevelStreaming.
 The only pure-vanilla crash I noticed was on clicking "Continue Game", which seems fixed by MadnessPatch, and was not studied further.
 
 ## What it fixes
