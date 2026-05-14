@@ -35,7 +35,7 @@ Run `launch-alice-cheatengine.ps1` from this directory. It will:
 
 1. Open Cheat Engine and attach to `AliceMadnessReturns.exe`
 2. Load `AliceMadnessReturns.CT`
-3. Tick entry ID 0 ("Fix Crashes")
+3. Tick "Fix Crashes" and "Kill Zombie BreakableObject"
 
 ## Requirements
 
