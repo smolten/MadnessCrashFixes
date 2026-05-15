@@ -1,5 +1,5 @@
 # MadnessCrashFixes
-<img width="1280" height="640" alt="four_hundred_thousand" src="https://github.com/user-attachments/assets/eebe31c3-80c0-4887-948a-950f761e81c2" />
+<img width="1280" height="640" alt="four_hundred_thousand" title="I play Alice: Madness Returns, and this, is my Alice. Her hair of three hundred twelve batches fires four hundred twenty operations per update. Each strand of hair overreads array by one, risking memory access violation eight hundred thousand times, per twelve sec" src="https://github.com/user-attachments/assets/eebe31c3-80c0-4887-948a-950f761e81c2" />
 
 Cheat Engine table and launch/hook helper script for **Alice: Madness Returns** to fix several crashes, written by asking Claude Opus 4.6/4.7 to spam Lua commands at Cheat Engine. These bugs do seem to exist in the base game, but were noticed only when using [MadnessPatch](https://github.com/Wemino/MadnessPatch), probably due to additional memory pressure of the mod installation, or in the case of Ch 5's Rolling-Ball Loading Crash (Zombie Object) some pre-existing problem may be made worse by DisableBackgroundLevelStreaming.
 The only pure-vanilla crash I noticed was on clicking "Continue Game", which never occured with MadnessPatch running, and was not studied further.
